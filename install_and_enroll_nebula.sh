@@ -159,24 +159,15 @@ sed -i '/^ASSIGNED_OCTET=/d' "${CONF_FILE}"
 echo "ASSIGNED_NEBULA_IP=${assigned_ip}" >> "${CONF_FILE}"
 echo "ASSIGNED_OCTET=${OCTET}" >> "${CONF_FILE}"
 
-# 6) Build Isolated Firewalls
-FIREWALL_INBOUND_STANZA=""
+# 6) Log targeted node initialize operations
 if [[ "${NODE_TYPE}" == "scraper" ]]; then
-  FIREWALL_INBOUND_STANZA="inbound: []"
   echo "[+] Initializing Scraper: 100% Locked-Down Inbound Firewall Configured."
 else
   require MASTER_SCRAPER_NEBULA_IP
-  FIREWALL_INBOUND_STANZA=$(cat <<YAML
-  inbound:
-    - port: 1080
-      proto: tcp
-      host: ${MASTER_SCRAPER_NEBULA_IP}
-YAML
-)
   echo "[+] Initializing Proxy Node: Binding port 1080 access strictly to Scraper Pool."
 fi
 
-# 7) Write Nebula proxy_config.yaml
+# 7) Write Nebula proxy_config.yaml (Inbound block evaluates natively to handle spacing)
 sudo tee "${CONFIG_PATH}" >/dev/null <<YAML
 pki:
   ca: ${PKI_PATH}/ca.crt
@@ -207,7 +198,7 @@ relay:
 
 tun:
   disabled: false
-  dev: nebula_proxies
+  dev: neb_prox
   drop_local_broadcast: false
   drop_multicast: false
   tx_queue: 500
@@ -228,7 +219,14 @@ firewall:
       proto: any
       host: any
 
-  ${FIREWALL_INBOUND_STANZA}
+  inbound:
+$(if [[ "${NODE_TYPE}" == "scraper" ]]; then
+    echo "    []"
+  else
+    echo "    - port: 1080"
+    echo "      proto: tcp"
+    echo "      host: ${MASTER_SCRAPER_NEBULA_IP}"
+  fi)
 YAML
 
 # 8) Create systemd service
