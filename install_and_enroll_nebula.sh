@@ -39,10 +39,10 @@ fi
 
 if [[ "${UNDERLAY_MODE}" == "public" ]]; then
   require LIGHTHOUSE_PUBLIC_HOST
-  LIGHTHOUSE_TARGET_HOST="${LIGHTHOUSE_PUBLIC_HOST}"
+  LIGHTHOUSE_UNDERLAY_ADDR="${LIGHTHOUSE_PUBLIC_HOST}:${NEBULA_LISTEN_PORT}"
 else
   require LIGHTHOUSE_PRIVATE_IP
-  LIGHTHOUSE_TARGET_HOST="${LIGHTHOUSE_PRIVATE_IP}"
+  LIGHTHOUSE_UNDERLAY_ADDR="${LIGHTHOUSE_PRIVATE_IP}:${NEBULA_LISTEN_PORT}"
 fi
 
 # Auto-detect arch
@@ -159,32 +159,13 @@ sed -i '/^ASSIGNED_OCTET=/d' "${CONF_FILE}"
 echo "ASSIGNED_NEBULA_IP=${assigned_ip}" >> "${CONF_FILE}"
 echo "ASSIGNED_OCTET=${OCTET}" >> "${CONF_FILE}"
 
-# 6) Log targeted node initialize operations & resolve Lighthouse underlay IP
+# 6) Log targeted node initialize operations
 if [[ "${NODE_TYPE}" == "scraper" ]]; then
   echo "[+] Initializing Scraper: 100% Locked-Down Inbound Firewall Configured."
 else
   require MASTER_SCRAPER_NEBULA_IP
   echo "[+] Initializing Proxy Node: Binding port 1080 access strictly to Scraper Pool."
 fi
-
-echo "[*] Resolving Lighthouse underlay address for Nebula v2 target profile..."
-RESOLVED_LIGHTHOUSE_IP=""
-if command -v dig >/dev/null 2>&1; then
-  RESOLVED_LIGHTHOUSE_IP="$(dig +short "${LIGHTHOUSE_TARGET_HOST}" | tail -n1)"
-fi
-
-# Fallback to getent if dig fails or isn't installed (handles raw IPs gracefully too)
-if [[ -z "${RESOLVED_LIGHTHOUSE_IP}" ]]; then
-  RESOLVED_LIGHTHOUSE_IP="$(getent ahosts "${LIGHTHOUSE_TARGET_HOST}" | awk '{print $1}' | head -n1)"
-fi
-
-if [[ -z "${RESOLVED_LIGHTHOUSE_IP}" ]]; then
-  echo "[!] Error: Failed to resolve underlay host targeting: ${LIGHTHOUSE_TARGET_HOST}"
-  exit 1
-fi
-
-LIGHTHOUSE_UNDERLAY_ADDR="${RESOLVED_LIGHTHOUSE_IP}:${NEBULA_LISTEN_PORT}"
-echo "    -> Resolved to: ${LIGHTHOUSE_UNDERLAY_ADDR}"
 
 # 7) Write Nebula proxy_config.yaml (Inbound block evaluates natively to handle spacing)
 sudo tee "${CONFIG_PATH}" >/dev/null <<YAML
