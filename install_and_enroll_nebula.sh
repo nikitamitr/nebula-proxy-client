@@ -239,7 +239,7 @@ $(if [[ "${NODE_TYPE}" == "scraper" ]]; then
   elif [[ "${NODE_TYPE}" == "proxy+ssh" ]]; then
     echo "    - port: 1080"
     echo "      proto: tcp"
-    echo "      host: ${MASTER_SCRAPER_NEBULA_IP}"
+    echo "      group: ScraperNodes"
     echo "    - port: 22"
     echo "      proto: tcp"
     echo "      host: any"
@@ -250,7 +250,7 @@ $(if [[ "${NODE_TYPE}" == "scraper" ]]; then
   else
     echo "    - port: 1080"
     echo "      proto: tcp"
-    echo "      host: ${MASTER_SCRAPER_NEBULA_IP}"
+    echo "      group: ScraperNodes"
   fi)
 YAML
 
