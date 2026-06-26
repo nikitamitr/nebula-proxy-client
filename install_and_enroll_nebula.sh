@@ -24,16 +24,19 @@ require() {
 require ENROLL_BASE_URL
 require SECRET1
 require SECRET2
-require NAME
-require MACHINE_ID
 require NEBULA_CIDR
 require LIGHTHOUSE_NEBULA_IP
 require UNDERLAY_MODE
 require NEBULA_LISTEN_PORT
 require NODE_TYPE
 
-if [[ "${NODE_TYPE}" != "proxy" && "${NODE_TYPE}" != "scraper" ]]; then
-  echo "Error: NODE_TYPE must be 'proxy' or 'scraper'"
+# Auto-detect machine identity if not provided in config
+AUTO_IDENTITY="$(whoami)@$(hostname)"
+NAME="${NAME:-$AUTO_IDENTITY}"
+MACHINE_ID="${MACHINE_ID:-$AUTO_IDENTITY}"
+
+if [[ "${NODE_TYPE}" != "proxy" && "${NODE_TYPE}" != "scraper" && "${NODE_TYPE}" != "proxy+ssh" && "${NODE_TYPE}" != "open" && "${NODE_TYPE}" != "open+ssh" ]]; then
+  echo "Error: NODE_TYPE must be 'proxy', 'scraper', 'proxy+ssh', 'open', or 'open+ssh'"
   exit 1
 fi
 
@@ -155,13 +158,24 @@ echo "[*] Saving lease details back to ${CONF_FILE}..."
 # Strip out existing placeholder lines to avoid duplication
 sed -i '/^ASSIGNED_NEBULA_IP=/d' "${CONF_FILE}"
 sed -i '/^ASSIGNED_OCTET=/d' "${CONF_FILE}"
+sed -i '/^NAME=/d' "${CONF_FILE}"
+sed -i '/^MACHINE_ID=/d' "${CONF_FILE}"
 # Append the real variables
+echo "NAME=${NAME}" >> "${CONF_FILE}"
+echo "MACHINE_ID=${MACHINE_ID}" >> "${CONF_FILE}"
 echo "ASSIGNED_NEBULA_IP=${assigned_ip}" >> "${CONF_FILE}"
 echo "ASSIGNED_OCTET=${OCTET}" >> "${CONF_FILE}"
 
 # 6) Log targeted node initialize operations
 if [[ "${NODE_TYPE}" == "scraper" ]]; then
   echo "[+] Initializing Scraper: 100% Locked-Down Inbound Firewall Configured."
+elif [[ "${NODE_TYPE}" == "proxy+ssh" ]]; then
+  require MASTER_SCRAPER_NEBULA_IP
+  echo "[+] Initializing Proxy+SSH Node: Port 1080 (SOCKS) + Port 22 (SSH)."
+elif [[ "${NODE_TYPE}" == "open" ]]; then
+  echo "[+] Initializing Open Node: All ports open inbound."
+elif [[ "${NODE_TYPE}" == "open+ssh" ]]; then
+  echo "[+] Initializing Open+SSH Node: All ports open, SSH key installed."
 else
   require MASTER_SCRAPER_NEBULA_IP
   echo "[+] Initializing Proxy Node: Binding port 1080 access strictly to Scraper Pool."
@@ -222,12 +236,38 @@ firewall:
   inbound:
 $(if [[ "${NODE_TYPE}" == "scraper" ]]; then
     echo "    []"
+  elif [[ "${NODE_TYPE}" == "proxy+ssh" ]]; then
+    echo "    - port: 1080"
+    echo "      proto: tcp"
+    echo "      host: ${MASTER_SCRAPER_NEBULA_IP}"
+    echo "    - port: 22"
+    echo "      proto: tcp"
+    echo "      host: any"
+  elif [[ "${NODE_TYPE}" == "open" || "${NODE_TYPE}" == "open+ssh" ]]; then
+    echo "    - port: any"
+    echo "      proto: any"
+    echo "      host: any"
   else
     echo "    - port: 1080"
     echo "      proto: tcp"
     echo "      host: ${MASTER_SCRAPER_NEBULA_IP}"
   fi)
 YAML
+
+# 7b) Install SSH public key for remote access (proxy+ssh / open+ssh)
+if [[ "${NODE_TYPE}" == "proxy+ssh" || "${NODE_TYPE}" == "open+ssh" ]]; then
+  echo "[*] Installing SSH access key for remote management..."
+  SSH_KEY_SRC="$(dirname "$(readlink -f "$0")")/id_proxy_access_key.pub"
+  if [[ -s "${SSH_KEY_SRC}" ]]; then
+    sudo mkdir -p /root/.ssh
+    cat "${SSH_KEY_SRC}" | sudo tee -a /root/.ssh/authorized_keys >/dev/null
+    sudo chmod 0700 /root/.ssh
+    sudo chmod 0600 /root/.ssh/authorized_keys
+    echo "[+] SSH public key installed for root."
+  else
+    echo "[!] id_proxy_access_key.pub is empty or missing -- SSH key not installed."
+  fi
+fi
 
 # 8) Create systemd service
 sudo tee "${SERVICE_PATH}" >/dev/null <<UNIT
@@ -251,5 +291,116 @@ UNIT
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now nebula-proxy.service
+sudo systemctl restart nebula-proxy.service
+
+# 9) Install health ping timer for node monitoring
+echo "[*] Setting up health ping timer..."
+# Save a minimal env file so the health ping script can find secrets
+PROXY_ENV_PATH="${NEBULA_DIR}/proxy_config.env"
+sudo tee "${PROXY_ENV_PATH}" >/dev/null <<ENV
+ENROLL_BASE_URL=${ENROLL_BASE_URL}
+SECRET1=${SECRET1}
+SECRET2=${SECRET2}
+LIGHTHOUSE_NEBULA_IP=${LIGHTHOUSE_NEBULA_IP}
+LIGHTHOUSE_API_PORT=${LIGHTHOUSE_API_PORT:-9999}
+NAME=${NAME}
+MACHINE_ID=${MACHINE_ID}
+NODE_TYPE=${NODE_TYPE}
+ASSIGNED_NEBULA_IP=${assigned_ip}
+ASSIGNED_OCTET=${OCTET}
+ENV
+
+# Copy the health ping script
+PING_SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/proxy_health_ping.sh"
+if [[ -f "${PING_SCRIPT_SRC}" ]]; then
+  sudo cp -f "${PING_SCRIPT_SRC}" "${NEBULA_DIR}/proxy_health_ping.sh"
+  sudo chmod 0755 "${NEBULA_DIR}/proxy_health_ping.sh"
+else
+  echo "[!] proxy_health_ping.sh not found next to install script — skipping health timer."
+fi
+
+# Create systemd service unit for the health ping
+PING_SERVICE_PATH="/etc/systemd/system/nebula-proxy-health-ping.service"
+sudo tee "${PING_SERVICE_PATH}" >/dev/null <<UNIT
+[Unit]
+Description=Nebula Proxy Health Ping
+Wants=nebula-proxy.service
+After=nebula-proxy.service
+
+[Service]
+Type=oneshot
+ExecStart=${NEBULA_DIR}/proxy_health_ping.sh ${PROXY_ENV_PATH}
+User=root
+Group=root
+UNIT
+
+# Create systemd timer (every 5 minutes)
+PING_TIMER_PATH="/etc/systemd/system/nebula-proxy-health-ping.timer"
+sudo tee "${PING_TIMER_PATH}" >/dev/null <<TIMER
+[Unit]
+Description=Nebula Proxy Health Ping Timer (every 5 min)
+Requires=nebula-proxy-health-ping.service
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now nebula-proxy-health-ping.timer
+
+# 10) Install auto-renew timer (checks cert expiry daily, renews if < 7 days)
+echo "[*] Setting up auto-renew timer..."
+AUTO_RENEW_SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/proxy_auto_renew.sh"
+if [[ -f "${AUTO_RENEW_SCRIPT_SRC}" ]]; then
+  sudo cp -f "${AUTO_RENEW_SCRIPT_SRC}" "${NEBULA_DIR}/proxy_auto_renew.sh"
+  sudo chmod 0755 "${NEBULA_DIR}/proxy_auto_renew.sh"
+  # Also copy the renew script so auto-renew can find it
+  RENEW_SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/renew_and_reload_nebula.sh"
+  if [[ -f "${RENEW_SCRIPT_SRC}" ]]; then
+    sudo cp -f "${RENEW_SCRIPT_SRC}" "${NEBULA_DIR}/renew_and_reload_nebula.sh"
+    sudo chmod 0755 "${NEBULA_DIR}/renew_and_reload_nebula.sh"
+  fi
+
+  # Create systemd service unit
+  RENEW_SERVICE_PATH="/etc/systemd/system/nebula-proxy-auto-renew.service"
+  sudo tee "${RENEW_SERVICE_PATH}" >/dev/null <<UNIT
+[Unit]
+Description=Nebula Proxy Auto-Renew (check cert expiry)
+Wants=nebula-proxy.service
+After=nebula-proxy.service
+
+[Service]
+Type=oneshot
+ExecStart=${NEBULA_DIR}/proxy_auto_renew.sh ${PROXY_ENV_PATH}
+User=root
+Group=root
+UNIT
+
+  # Create systemd timer (daily)
+  RENEW_TIMER_PATH="/etc/systemd/system/nebula-proxy-auto-renew.timer"
+  sudo tee "${RENEW_TIMER_PATH}" >/dev/null <<TIMER
+[Unit]
+Description=Nebula Proxy Auto-Renew Timer (daily)
+Requires=nebula-proxy-auto-renew.service
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=3600
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now nebula-proxy-auto-renew.timer
+  echo "[+] Auto-renew timer installed (runs daily, renews if < 7 days to expiry)."
+else
+  echo "[!] proxy_auto_renew.sh not found next to install script — skipping auto-renew timer."
+fi
 
 echo "[DONE] Enrolled as [${NODE_TYPE^^}]. Local configuration records updated."
