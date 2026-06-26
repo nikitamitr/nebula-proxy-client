@@ -442,12 +442,17 @@ if [[ "${NODE_TYPE}" != "scraper" ]]; then
   fi
   echo "[+] Auto-detected external internet interface: ${EXT_IFACE}"
 
-  # Overwrite configuration with secure mesh-only definitions
+  # Overwrite configuration with secure mesh-only definitions and syslog logging sandbox routing
   sudo tee /etc/danted.conf >/dev/null <<EOF
-logoutput: /var/log/danted.log
+# Route log events straight to syslog to satisfy systemd sandboxing rules
+logoutput: syslog
 
-# Listen target
-internal: neb_prox port = 1080
+# Drops privileges safely after initialization
+user.privileged: root
+user.unprivileged: proxy
+
+# Listen target (Explicit mesh IP binding avoids runtime timing issues)
+internal: ${assigned_ip} port = 1080
 
 # Outbound gateway
 external: ${EXT_IFACE}
