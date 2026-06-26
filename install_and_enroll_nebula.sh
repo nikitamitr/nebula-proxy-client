@@ -76,7 +76,7 @@ if [[ ! -f "${NEBULA_BIN}" ]]; then
   sudo mkdir -p "$(dirname "${NEBULA_BIN}")"
   
   tmp_bin_dir="$(mktemp -d)"
-  curl -fsSL "https://github.com/slackhq/nebula/releases/download/v1.9.3/nebula-linux-${ARCH}.tar.gz" -o "${tmp_bin_dir}/nebula.tar.gz"
+  curl -fsSL "https://github.com/slackhq/nebula/releases/download/v1.10.3/nebula-linux-${ARCH}.tar.gz" -o "${tmp_bin_dir}/nebula.tar.gz"
   sudo tar -xzf "${tmp_bin_dir}/nebula.tar.gz" -C "$(dirname "${NEBULA_BIN}")" nebula nebula-cert
   sudo chmod +x "${NEBULA_BIN}" "${NEBULA_CERT_BIN}"
   rm -rf "${tmp_bin_dir}"
