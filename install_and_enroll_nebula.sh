@@ -70,6 +70,35 @@ CONFIG_PATH="${NEBULA_DIR}/proxy_config.yaml"
 PKI_PATH="${NEBULA_DIR}/pki"
 SERVICE_PATH="/etc/systemd/system/nebula-proxy.service"
 
+# --- GUARD 1: Install Nebula Binaries if missing ---
+if [[ ! -f "${NEBULA_BIN}" ]]; then
+  echo "[*] Nebula execution binary missing. Downloading v1.9.3 release..."
+  sudo mkdir -p "$(dirname "${NEBULA_BIN}")"
+  
+  tmp_bin_dir="$(mktemp -d)"
+  curl -fsSL "https://github.com/slackhq/nebula/releases/download/v1.9.3/nebula-linux-${ARCH}.tar.gz" -o "${tmp_bin_dir}/nebula.tar.gz"
+  sudo tar -xzf "${tmp_bin_dir}/nebula.tar.gz" -C "$(dirname "${NEBULA_BIN}")" nebula nebula-cert
+  sudo chmod +x "${NEBULA_BIN}" "${NEBULA_CERT_BIN}"
+  rm -rf "${tmp_bin_dir}"
+  echo "[+] Nebula binaries successfully deployed."
+fi
+
+# --- GUARD 2: Avoid double enrollment if lease already exists ---
+if [[ -n "${ASSIGNED_NEBULA_IP:-}" && -f "${PKI_PATH}/host.crt" && -f "${CONFIG_PATH}" ]]; then
+  echo "[*] Existing lease detected (${ASSIGNED_NEBULA_IP}). Ensuring network daemon is active..."
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now nebula-proxy.service
+  sudo systemctl restart nebula-proxy.service
+  
+  # Ensure Dante is also up if not a scraper
+  if [[ "${NODE_TYPE}" != "scraper" ]]; then
+    sudo systemctl enable --now danted 2>/dev/null || sudo systemctl enable --now sockd 2>/dev/null
+    sudo systemctl restart danted 2>/dev/null || sudo systemctl restart sockd 2>/dev/null
+  fi
+  echo "[DONE] Node is already correctly enrolled and configured. Exiting cleanly."
+  exit 0
+fi
+
 sudo mkdir -p "${NEBULA_DIR}"
 sudo mkdir -p "${PKI_PATH}"
 
@@ -86,7 +115,6 @@ req_body="$(cat <<JSON
 JSON
 )"
 
-# Notice the updated /proxy/enroll path suffix
 resp="$(
   curl -fsS -X POST "${ENROLL_BASE_URL}/proxy/enroll/request" \
     -H "Content-Type: application/json" \
@@ -155,12 +183,11 @@ sudo chmod 0600 "${PKI_PATH}/host.key"
 
 # 5) SAVE ASSIGNED PARAMETERS BACK TO YOUR CONF FILE
 echo "[*] Saving lease details back to ${CONF_FILE}..."
-# Strip out existing placeholder lines to avoid duplication
 sed -i '/^ASSIGNED_NEBULA_IP=/d' "${CONF_FILE}"
 sed -i '/^ASSIGNED_OCTET=/d' "${CONF_FILE}"
 sed -i '/^NAME=/d' "${CONF_FILE}"
 sed -i '/^MACHINE_ID=/d' "${CONF_FILE}"
-# Append the real variables
+
 echo "NAME=${NAME}" >> "${CONF_FILE}"
 echo "MACHINE_ID=${MACHINE_ID}" >> "${CONF_FILE}"
 echo "ASSIGNED_NEBULA_IP=${assigned_ip}" >> "${CONF_FILE}"
@@ -181,7 +208,7 @@ else
   echo "[+] Initializing Proxy Node: Binding port 1080 access strictly to Scraper Pool."
 fi
 
-# 7) Write Nebula proxy_config.yaml (Inbound block evaluates natively to handle spacing)
+# 7) Write Nebula proxy_config.yaml
 sudo tee "${CONFIG_PATH}" >/dev/null <<YAML
 pki:
   ca: ${PKI_PATH}/ca.crt
@@ -256,21 +283,21 @@ YAML
 
 # 7b) Install SSH server and public key for remote access (proxy+ssh / open+ssh)
 if [[ "${NODE_TYPE}" == "proxy+ssh" || "${NODE_TYPE}" == "open+ssh" ]]; then
-  echo "[*] Ensuring SSH server is installed..."
-  if command -v apt-get >/dev/null 2>&1; then
-    sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server
-  elif command -v yum >/dev/null 2>&1; then
-    sudo yum install -y -q openssh-server
-  elif command -v dnf >/dev/null 2>&1; then
-    sudo dnf install -y -q openssh-server
-  elif command -v pacman >/dev/null 2>&1; then
-    sudo pacman -S --noconfirm openssh
-  elif command -v zypper >/dev/null 2>&1; then
-    sudo zypper install -y openssh
-  else
-    echo "[!] Could not detect package manager — please ensure openssh-server is installed manually."
+  if ! command -v sshd >/dev/null 2>&1 && ! command -v /usr/sbin/sshd >/dev/null 2>&1; then
+    echo "[*] Ensuring SSH server is installed..."
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server
+    elif command -v yum >/dev/null 2>&1; then
+      sudo yum install -y -q openssh-server
+    elif command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y -q openssh-server
+    elif command -v pacman >/dev/null 2>&1; then
+      sudo pacman -S --noconfirm openssh
+    elif command -v zypper >/dev/null 2>&1; then
+      sudo zypper install -y openssh
+    fi
   fi
-  sudo systemctl enable --now sshd 2>/dev/null || sudo systemctl enable --now ssh 2>/dev/null || echo "[!] Could not start SSH service (check sshd/ssh unit name)."
+  sudo systemctl enable --now sshd 2>/dev/null || sudo systemctl enable --now ssh 2>/dev/null || echo "[!] Could not start SSH service."
 
   echo "[*] Installing SSH access key for remote management..."
   SSH_KEY_SRC="$(dirname "$(readlink -f "$0")")/id_proxy_access_key.pub"
@@ -280,8 +307,6 @@ if [[ "${NODE_TYPE}" == "proxy+ssh" || "${NODE_TYPE}" == "open+ssh" ]]; then
     sudo chmod 0700 /root/.ssh
     sudo chmod 0600 /root/.ssh/authorized_keys
     echo "[+] SSH public key installed for root."
-  else
-    echo "[!] id_proxy_access_key.pub is empty or missing -- SSH key not installed."
   fi
 fi
 
@@ -311,7 +336,6 @@ sudo systemctl restart nebula-proxy.service
 
 # 9) Install health ping timer for node monitoring
 echo "[*] Setting up health ping timer..."
-# Save a minimal env file so the health ping script can find secrets
 PROXY_ENV_PATH="${NEBULA_DIR}/proxy_config.env"
 sudo tee "${PROXY_ENV_PATH}" >/dev/null <<ENV
 ENROLL_BASE_URL=${ENROLL_BASE_URL}
@@ -326,16 +350,12 @@ ASSIGNED_NEBULA_IP=${assigned_ip}
 ASSIGNED_OCTET=${OCTET}
 ENV
 
-# Copy the health ping script
 PING_SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/proxy_health_ping.sh"
 if [[ -f "${PING_SCRIPT_SRC}" ]]; then
   sudo cp -f "${PING_SCRIPT_SRC}" "${NEBULA_DIR}/proxy_health_ping.sh"
   sudo chmod 0755 "${NEBULA_DIR}/proxy_health_ping.sh"
-else
-  echo "[!] proxy_health_ping.sh not found next to install script — skipping health timer."
 fi
 
-# Create systemd service unit for the health ping
 PING_SERVICE_PATH="/etc/systemd/system/nebula-proxy-health-ping.service"
 sudo tee "${PING_SERVICE_PATH}" >/dev/null <<UNIT
 [Unit]
@@ -350,7 +370,6 @@ User=root
 Group=root
 UNIT
 
-# Create systemd timer (every 5 minutes)
 PING_TIMER_PATH="/etc/systemd/system/nebula-proxy-health-ping.timer"
 sudo tee "${PING_TIMER_PATH}" >/dev/null <<TIMER
 [Unit]
@@ -368,20 +387,19 @@ TIMER
 sudo systemctl daemon-reload
 sudo systemctl enable --now nebula-proxy-health-ping.timer
 
-# 10) Install auto-renew timer (checks cert expiry daily, renews if < 7 days)
+# 10) Install auto-renew timer
 echo "[*] Setting up auto-renew timer..."
 AUTO_RENEW_SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/proxy_auto_renew.sh"
 if [[ -f "${AUTO_RENEW_SCRIPT_SRC}" ]]; then
   sudo cp -f "${AUTO_RENEW_SCRIPT_SRC}" "${NEBULA_DIR}/proxy_auto_renew.sh"
   sudo chmod 0755 "${NEBULA_DIR}/proxy_auto_renew.sh"
-  # Also copy the renew script so auto-renew can find it
+  
   RENEW_SCRIPT_SRC="$(dirname "$(readlink -f "$0")")/renew_and_reload_nebula.sh"
   if [[ -f "${RENEW_SCRIPT_SRC}" ]]; then
     sudo cp -f "${RENEW_SCRIPT_SRC}" "${NEBULA_DIR}/renew_and_reload_nebula.sh"
     sudo chmod 0755 "${NEBULA_DIR}/renew_and_reload_nebula.sh"
   fi
 
-  # Create systemd service unit
   RENEW_SERVICE_PATH="/etc/systemd/system/nebula-proxy-auto-renew.service"
   sudo tee "${RENEW_SERVICE_PATH}" >/dev/null <<UNIT
 [Unit]
@@ -396,7 +414,6 @@ User=root
 Group=root
 UNIT
 
-  # Create systemd timer (daily)
   RENEW_TIMER_PATH="/etc/systemd/system/nebula-proxy-auto-renew.timer"
   sudo tee "${RENEW_TIMER_PATH}" >/dev/null <<TIMER
 [Unit]
@@ -415,69 +432,49 @@ TIMER
   sudo systemctl daemon-reload
   sudo systemctl enable --now nebula-proxy-auto-renew.timer
   echo "[+] Auto-renew timer installed (runs daily, renews if < 7 days to expiry)."
-else
-  echo "[!] proxy_auto_renew.sh not found next to install script — skipping auto-renew timer."
 fi
 
 # 11) Install and configure Dante SOCKS5 Proxy Server (Only for non-scraper nodes)
 if [[ "${NODE_TYPE}" != "scraper" ]]; then
   echo "[*] Node type is [${NODE_TYPE^^}], initializing Dante Server deployment..."
   
-  # Ensure the package is installed
-  if command -v apt-get >/dev/null 2>&1; then
-    sudo apt-get update -qq && sudo apt-get install -y -qq dante-server
-  elif command -v yum >/dev/null 2>&1; then
-    sudo yum install -y -q dante-server
-  elif command -v dnf >/dev/null 2>&1; then
-    sudo dnf install -y -q dante-server
-  else
-    echo "[!] Package manager not supported for automated Dante setup — please install manually."
+  if ! command -v danted >/dev/null 2>&1 && ! command -v sockd >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update -qq && sudo apt-get install -y -qq dante-server
+    elif command -v yum >/dev/null 2>&1; then
+      sudo yum install -y -q dante-server
+    elif command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y -q dante-server
+    fi
   fi
 
-  # Dynamically determine the machine's primary external interface handling internet traffic
   EXT_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
   if [[ -z "${EXT_IFACE}" ]]; then
-    # Reliable fallback to pull active physical interfaces if routing table is complex
     EXT_IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^(en|wl|eth)' | head -n1 || echo "eth0")
   fi
   echo "[+] Auto-detected external internet interface: ${EXT_IFACE}"
 
-  # Overwrite configuration with secure mesh-only definitions and syslog logging sandbox routing
   sudo tee /etc/danted.conf >/dev/null <<EOF
-# Route log events straight to syslog to satisfy systemd sandboxing rules
 logoutput: syslog
-
-# Drops privileges safely after initialization
 user.privileged: root
 user.unprivileged: proxy
-
-# Listen target (Explicit mesh IP binding avoids runtime timing issues)
 internal: ${assigned_ip} port = 1080
-
-# Outbound gateway
 external: ${EXT_IFACE}
-
-# Authentication
 socksmethod: none
 clientmethod: none
 
-# Inbound Network Security Routing Policies
 client pass {
     from: ${NEBULA_CIDR} to: 0.0.0.0/0
     log: connect disconnect error
 }
-
 client block {
     from: 0.0.0.0/0 to: 0.0.0.0/0
     log: connect error
 }
-
-# Proxy Forwarding Data Tunnel Policies
 socks pass {
     from: ${NEBULA_CIDR} to: 0.0.0.0/0
     log: connect disconnect error
 }
-
 socks block {
     from: 0.0.0.0/0 to: 0.0.0.0/0
     log: connect error
@@ -485,7 +482,6 @@ socks block {
 EOF
   echo "[+] Dante SOCKS5 runtime configuration written to /etc/danted.conf."
 
-  # Activate services across standard daemon unit name variations
   sudo systemctl daemon-reload
   sudo systemctl enable --now danted 2>/dev/null || sudo systemctl enable --now sockd 2>/dev/null
   sudo systemctl restart danted 2>/dev/null || sudo systemctl restart sockd 2>/dev/null
