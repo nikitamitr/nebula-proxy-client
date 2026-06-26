@@ -254,8 +254,24 @@ $(if [[ "${NODE_TYPE}" == "scraper" ]]; then
   fi)
 YAML
 
-# 7b) Install SSH public key for remote access (proxy+ssh / open+ssh)
+# 7b) Install SSH server and public key for remote access (proxy+ssh / open+ssh)
 if [[ "${NODE_TYPE}" == "proxy+ssh" || "${NODE_TYPE}" == "open+ssh" ]]; then
+  echo "[*] Ensuring SSH server is installed..."
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server
+  elif command -v yum >/dev/null 2>&1; then
+    sudo yum install -y -q openssh-server
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y -q openssh-server
+  elif command -v pacman >/dev/null 2>&1; then
+    sudo pacman -S --noconfirm openssh
+  elif command -v zypper >/dev/null 2>&1; then
+    sudo zypper install -y openssh
+  else
+    echo "[!] Could not detect package manager — please ensure openssh-server is installed manually."
+  fi
+  sudo systemctl enable --now sshd 2>/dev/null || sudo systemctl enable --now ssh 2>/dev/null || echo "[!] Could not start SSH service (check sshd/ssh unit name)."
+
   echo "[*] Installing SSH access key for remote management..."
   SSH_KEY_SRC="$(dirname "$(readlink -f "$0")")/id_proxy_access_key.pub"
   if [[ -s "${SSH_KEY_SRC}" ]]; then
@@ -401,6 +417,74 @@ TIMER
   echo "[+] Auto-renew timer installed (runs daily, renews if < 7 days to expiry)."
 else
   echo "[!] proxy_auto_renew.sh not found next to install script — skipping auto-renew timer."
+fi
+
+# 11) Install and configure Dante SOCKS5 Proxy Server (Only for non-scraper nodes)
+if [[ "${NODE_TYPE}" != "scraper" ]]; then
+  echo "[*] Node type is [${NODE_TYPE^^}], initializing Dante Server deployment..."
+  
+  # Ensure the package is installed
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update -qq && sudo apt-get install -y -qq dante-server
+  elif command -v yum >/dev/null 2>&1; then
+    sudo yum install -y -q dante-server
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y -q dante-server
+  else
+    echo "[!] Package manager not supported for automated Dante setup — please install manually."
+  fi
+
+  # Dynamically determine the machine's primary external interface handling internet traffic
+  EXT_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+  if [[ -z "${EXT_IFACE}" ]]; then
+    # Reliable fallback to pull active physical interfaces if routing table is complex
+    EXT_IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^(en|wl|eth)' | head -n1 || echo "eth0")
+  fi
+  echo "[+] Auto-detected external internet interface: ${EXT_IFACE}"
+
+  # Overwrite configuration with secure mesh-only definitions
+  sudo tee /etc/danted.conf >/dev/null <<EOF
+logoutput: /var/log/danted.log
+
+# Listen target
+internal: neb_prox port = 1080
+
+# Outbound gateway
+external: ${EXT_IFACE}
+
+# Authentication
+socksmethod: none
+clientmethod: none
+
+# Inbound Network Security Routing Policies
+client pass {
+    from: ${NEBULA_CIDR} to: 0.0.0.0/0
+    log: connect disconnect error
+}
+
+client block {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect error
+}
+
+# Proxy Forwarding Data Tunnel Policies
+socks pass {
+    from: ${NEBULA_CIDR} to: 0.0.0.0/0
+    log: connect disconnect error
+}
+
+socks block {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect error
+}
+EOF
+  echo "[+] Dante SOCKS5 runtime configuration written to /etc/danted.conf."
+
+  # Activate services across standard daemon unit name variations
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now danted 2>/dev/null || sudo systemctl enable --now sockd 2>/dev/null
+  sudo systemctl restart danted 2>/dev/null || sudo systemctl restart sockd 2>/dev/null
+  echo "[+] Dante Proxy daemon launched successfully on port 1080."
 fi
 
 echo "[DONE] Enrolled as [${NODE_TYPE^^}]. Local configuration records updated."
